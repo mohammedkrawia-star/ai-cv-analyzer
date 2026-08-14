@@ -1,6 +1,7 @@
 export const ENV = {
   isProduction: process.env.NODE_ENV === "production",
-  // Anthropic Claude API — get a key at https://console.anthropic.com/
-  anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? "",
-  anthropicModel: process.env.ANTHROPIC_MODEL ?? "claude-sonnet-5",
+  // Google Gemini API — free tier, no credit card required.
+  // Get a key at https://aistudio.google.com/apikey
+  geminiApiKey: process.env.GEMINI_API_KEY ?? "",
+  geminiModel: process.env.GEMINI_MODEL ?? "gemini-2.5-flash",
 };

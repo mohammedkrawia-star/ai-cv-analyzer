@@ -1,6 +1,6 @@
-// Thin wrapper around the Anthropic Messages API.
-// This replaces the old Manus "forge" gateway so the app runs fully
-// independently with your own Anthropic API key (ANTHROPIC_API_KEY).
+// Thin wrapper around the Google Gemini API (generateContent).
+// Uses the free tier — no credit card required. Get a key at
+// https://aistudio.google.com/apikey and set GEMINI_API_KEY.
 import { ENV } from "./env";
 
 export type Role = "system" | "user" | "assistant";
@@ -50,8 +50,7 @@ export type InvokeResult = {
   };
 };
 
-const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_VERSION = "2023-06-01";
+const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 const DEFAULT_MAX_TOKENS = 8192;
 
 const RETRY_MAX_RETRIES = 4;
@@ -109,34 +108,29 @@ const fetchWithBackoff = async (url: string, init: RequestInit): Promise<Respons
 };
 
 const assertApiKey = () => {
-  if (!ENV.anthropicApiKey) {
+  if (!ENV.geminiApiKey) {
     throw new Error(
-      "ANTHROPIC_API_KEY is not configured. Set it in your server environment (see .env.example).",
+      "GEMINI_API_KEY is not configured. Set it in your server environment (see .env.example). Get a free key at https://aistudio.google.com/apikey",
     );
   }
 };
 
-type AnthropicContentBlock =
-  | { type: "text"; text: string }
-  | { type: "document"; source: { type: "base64"; media_type: "application/pdf"; data: string } };
+type GeminiPart = { text: string } | { inline_data: { mime_type: "application/pdf"; data: string } };
 
 const ensureArray = (value: MessageContent | MessageContent[]): MessageContent[] =>
   Array.isArray(value) ? value : [value];
 
-const toAnthropicBlock = (part: MessageContent): AnthropicContentBlock => {
+const toGeminiPart = (part: MessageContent): GeminiPart => {
   if (typeof part === "string") {
-    return { type: "text", text: part };
+    return { text: part };
   }
   if (part.type === "text") {
-    return { type: "text", text: part.text };
+    return { text: part.text };
   }
   if (part.type === "file_url") {
     const dataUrl = part.file_url.url;
     const base64 = dataUrl.includes(",") ? dataUrl.split(",").slice(1).join(",") : dataUrl;
-    return {
-      type: "document",
-      source: { type: "base64", media_type: "application/pdf", data: base64 },
-    };
+    return { inline_data: { mime_type: "application/pdf", data: base64 } };
   }
   throw new Error("Unsupported message content part");
 };
@@ -146,37 +140,40 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
 
   const { messages, model, maxTokens, max_tokens } = params;
 
-  // Anthropic takes `system` as a separate top-level field, not a message role.
+  // Gemini takes system instructions as a separate top-level field.
   const systemParts = messages
     .filter((m) => m.role === "system")
-    .map((m) => ensureArray(m.content).map(toAnthropicBlock))
+    .map((m) => ensureArray(m.content).map(toGeminiPart))
     .flat()
-    .filter((b): b is { type: "text"; text: string } => b.type === "text")
-    .map((b) => b.text)
+    .filter((p): p is { text: string } => "text" in p)
+    .map((p) => p.text)
     .join("\n\n");
 
-  const conversation = messages
+  const contents = messages
     .filter((m) => m.role !== "system")
     .map((m) => ({
-      role: m.role as "user" | "assistant",
-      content: ensureArray(m.content).map(toAnthropicBlock),
+      role: m.role === "assistant" ? "model" : "user",
+      parts: ensureArray(m.content).map(toGeminiPart),
     }));
 
   const payload: Record<string, unknown> = {
-    model: model || ENV.anthropicModel,
-    max_tokens: max_tokens ?? maxTokens ?? DEFAULT_MAX_TOKENS,
-    messages: conversation,
+    contents,
+    generationConfig: {
+      maxOutputTokens: max_tokens ?? maxTokens ?? DEFAULT_MAX_TOKENS,
+    },
   };
   if (systemParts) {
-    payload.system = systemParts;
+    payload.system_instruction = { parts: [{ text: systemParts }] };
   }
 
-  const response = await fetchWithBackoff(ANTHROPIC_API_URL, {
+  const resolvedModel = model || ENV.geminiModel;
+  const url = `${GEMINI_API_BASE}/${resolvedModel}:generateContent`;
+
+  const response = await fetchWithBackoff(url, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-api-key": ENV.anthropicApiKey,
-      "anthropic-version": ANTHROPIC_VERSION,
+      "x-goog-api-key": ENV.geminiApiKey,
     },
     body: JSON.stringify(payload),
   });
@@ -187,34 +184,36 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
   }
 
   const data = (await response.json()) as {
-    id: string;
-    model: string;
-    content: Array<{ type: string; text?: string }>;
-    stop_reason: string | null;
-    usage?: { input_tokens: number; output_tokens: number };
+    candidates?: Array<{
+      content?: { parts?: Array<{ text?: string }> };
+      finishReason?: string;
+    }>;
+    usageMetadata?: { promptTokenCount: number; candidatesTokenCount: number; totalTokenCount: number };
+    modelVersion?: string;
   };
 
-  const text = (data.content || [])
-    .filter((block) => block.type === "text" && typeof block.text === "string")
-    .map((block) => block.text as string)
+  const parts = data.candidates?.[0]?.content?.parts ?? [];
+  const text = parts
+    .filter((p) => typeof p.text === "string")
+    .map((p) => p.text as string)
     .join("\n")
     .trim();
 
   return {
-    id: data.id,
-    model: data.model,
+    id: `gemini-${Date.now()}`,
+    model: data.modelVersion || resolvedModel,
     choices: [
       {
         index: 0,
         message: { role: "assistant", content: text },
-        finish_reason: data.stop_reason,
+        finish_reason: data.candidates?.[0]?.finishReason ?? null,
       },
     ],
-    usage: data.usage
+    usage: data.usageMetadata
       ? {
-          prompt_tokens: data.usage.input_tokens,
-          completion_tokens: data.usage.output_tokens,
-          total_tokens: data.usage.input_tokens + data.usage.output_tokens,
+          prompt_tokens: data.usageMetadata.promptTokenCount,
+          completion_tokens: data.usageMetadata.candidatesTokenCount,
+          total_tokens: data.usageMetadata.totalTokenCount,
         }
       : undefined,
   };
